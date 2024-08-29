@@ -100,8 +100,7 @@ static int callback_shell(struct lws *wsi, enum lws_callback_reasons reason,
         }
         printf("'\n");
         pss->buffer_len = n;
-        n = lws_write(wsi, pss->buffer + LWS_PRE, pss->buffer_len,
-                      LWS_WRITE_TEXT);
+        n = lws_write(wsi, pss->buffer + LWS_PRE, pss->buffer_len, LWS_WRITE_BINARY);
         if (n < 0) {
           perror("lws_write failed");
           return -1;
