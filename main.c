@@ -1,11 +1,13 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <libwebsockets.h>
+#include <netinet/in.h>
 #include <pty.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #define VERSION "0.2.0"
@@ -25,6 +27,18 @@ const char *global_command;
 volatile int force_exit = 0;
 int keep_running_after_disconnect = 0;
 int ws_log_level = LLL_ERR | LLL_WARN; // Default log level
+int max_connections = 1; // Максимальное количество подключений
+int active_connections = 0; // Счетчик активных подключений
+int ws_timeout_sec = 5; //timeout
+
+
+// Обработчик сигнала тайм-аута
+void timeout_handler(int signum) {
+  if (active_connections == 0) {
+    printf("No connections received in %d. Shutting down...\n", ws_timeout_sec);
+    force_exit = 1; //force exit
+  }
+}
 
 static int callback_shell(struct lws *wsi, enum lws_callback_reasons reason,
                           void *user, void *in, size_t len) {
@@ -33,7 +47,15 @@ static int callback_shell(struct lws *wsi, enum lws_callback_reasons reason,
 
   switch (reason) {
   case LWS_CALLBACK_ESTABLISHED:
-    printf("Connection established\n");
+    if (active_connections >= max_connections) {
+      printf("Max connections reached. Closing new connection.\n");
+      lws_close_reason(wsi, LWS_CLOSE_STATUS_GOINGAWAY,
+                       (unsigned char *)"Max connections reached", 21);
+      return -1; // close if connection limit reached
+    }
+    active_connections++;
+    printf("Connection established, active connections: %d\n",
+           active_connections);
     pss->command = global_command;
     pss->child_pid = forkpty(&pss->pty_fd, NULL, NULL, NULL);
     if (pss->child_pid == -1) {
@@ -100,7 +122,8 @@ static int callback_shell(struct lws *wsi, enum lws_callback_reasons reason,
         }
         printf("'\n");
         pss->buffer_len = n;
-        n = lws_write(wsi, pss->buffer + LWS_PRE, pss->buffer_len, LWS_WRITE_BINARY);
+        n = lws_write(wsi, pss->buffer + LWS_PRE, pss->buffer_len,
+                      LWS_WRITE_BINARY);
         if (n < 0) {
           perror("lws_write failed");
           return -1;
@@ -119,6 +142,7 @@ static int callback_shell(struct lws *wsi, enum lws_callback_reasons reason,
 
   case LWS_CALLBACK_CLOSED:
     printf("Connection closed\n");
+    active_connections--;
     if (pss->child_pid > 0) {
       printf("Terminating child process %d\n", pss->child_pid);
       kill(pss->child_pid, SIGTERM);
@@ -155,7 +179,7 @@ static struct lws_protocols protocols[] = {
 void usage(const char *prog_name) {
   fprintf(stderr,
           "Usage: %s <port> <command> [keep_running_after_disconnect] "
-          "[log_level]\n",
+          "[log_level] [timeout]\n",
           prog_name);
   fprintf(stderr, "  <port>    : Port number for WebSocket server\n");
   fprintf(stderr, "  <command> : Command to execute in PTY\n");
@@ -173,6 +197,8 @@ void usage(const char *prog_name) {
       stderr,
       "                LLL_ERR | LLL_WARN | LLL_NOTICE | LLL_INFO log: %d\n",
       LLL_ERR | LLL_WARN | LLL_NOTICE | LLL_INFO);
+  fprintf(stderr,
+          "  [timeout] : Optional, timeout in seconds (default: %d)\n", ws_timeout_sec);
 }
 
 int main(int argc, char **argv) {
@@ -186,6 +212,10 @@ int main(int argc, char **argv) {
   }
 
   port = atoi(argv[1]);
+  if (port < 1){
+    fprintf(stderr, "error: port must be > 0\n");
+    return 1;
+  }
   global_command = argv[2];
 
   if (argc > 3) {
@@ -196,7 +226,10 @@ int main(int argc, char **argv) {
     ws_log_level = atoi(argv[4]);
   }
 
-  lws_set_log_level(ws_log_level, NULL);
+  if (argc > 5) {
+    ws_timeout_sec = atoi(argv[5]);
+  }
+
 
   memset(&info, 0, sizeof(info));
   info.port = port;
@@ -205,59 +238,44 @@ int main(int argc, char **argv) {
   info.uid = -1;
   info.options = LWS_SERVER_OPTION_VALIDATE_UTF8;
 
-  printf("Creating libwebsockets context\n");
-  context = lws_create_context(&info);
-  if (!context) {
-    fprintf(stderr, "lws init failed\n");
-    return 1;
-  }
-
-  // check port
+  // test before start
   int sock_fd = socket(AF_INET, SOCK_STREAM, 0);
   if (sock_fd < 0) {
     perror("socket creation failed");
     return 1;
   }
 
-  // set option SO_REUSEADDR
-  int opt = 1;
-  if (setsockopt(sock_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
-    perror("setsockopt(SO_REUSEADDR) failed");
-    close(sock_fd);
-    lws_context_destroy(context);
-    return 1;
-  }
-
   struct sockaddr_in addr;
   addr.sin_family = AF_INET;
-  addr.sin_port = htons(port); // Используем порт из аргументов или конфигурации
+  addr.sin_port = htons(port);
   addr.sin_addr.s_addr = INADDR_ANY;
 
-  // check is port is bound
+  // check port bind
   if (bind(sock_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-    if (errno == EADDRINUSE) {
-      printf("WebSocket server successfully bound to port %d\n", port);
-    } else if (errno == EACCES) {
-      fprintf(stderr, "Permission denied to bind to port %d\n", port);
-      lws_context_destroy(context);
-      close(sock_fd);
-      return 1;
-    } else {
-      perror("Port check failed (bind)");
-      close(sock_fd);
-      lws_context_destroy(context);
-      return 1;
-    }
-  } else {
-    fprintf(stderr, "Port %d error\n", port);
+    fprintf(stderr, "error: bind port %d failed: %s\n", port, strerror(errno));
     close(sock_fd);
-    lws_context_destroy(context);
+    return 1;
+  }
+  close(sock_fd); // close fd after test
+
+
+  printf("Creating libwebsockets context\n");
+  lws_set_log_level(ws_log_level, NULL);
+  context = lws_create_context(&info);
+  if (!context) {
+    fprintf(stderr, "lws init failed\n");
     return 1;
   }
 
-  printf("WebSocket server for '%s' started on port %d\n",
 
-         global_command, port);
+  // set timeout
+  if (ws_timeout_sec > 0) {
+    signal(SIGALRM, timeout_handler);
+    alarm(ws_timeout_sec);
+  }
+
+  printf("WebSocket server for '%s' started on port %d\n", global_command,
+         port);
 
   while (!force_exit) {
     int n = lws_service(context, 50);
