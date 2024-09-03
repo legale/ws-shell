@@ -30,8 +30,7 @@ int ws_log_level = LLL_ERR; // Default log level
 int max_connections = 1; // Максимальное количество подключений
 int active_connections = 0; // Счетчик активных подключений
 int ws_timeout_sec = 10; //timeout
-int run_foreground = 0; //run as daemon by default
-
+int run_foreground = 1; //run program foreground
 
 // Обработчик сигнала тайм-аута
 void timeout_handler(int signum) {
