@@ -10,7 +10,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#define VERSION "0.2.0"
+#define VERSION "0.2.2"
 #define BUFFER_SIZE 4096
 
 struct per_session_data {
@@ -26,16 +26,17 @@ struct per_session_data {
 const char *global_command;
 volatile int force_exit = 0;
 int keep_running_after_disconnect = 0;
-int ws_log_level = LLL_ERR | LLL_WARN; // Default log level
+int ws_log_level = LLL_ERR; // Default log level
 int max_connections = 1; // Максимальное количество подключений
 int active_connections = 0; // Счетчик активных подключений
-int ws_timeout_sec = 5; //timeout
+int ws_timeout_sec = 10; //timeout
+int run_foreground = 0; //run as daemon by default
 
 
 // Обработчик сигнала тайм-аута
 void timeout_handler(int signum) {
   if (active_connections == 0) {
-    printf("No connections received in %d. Shutting down...\n", ws_timeout_sec);
+    printf("No connections received in %d sec. Shutting down...\n", ws_timeout_sec);
     force_exit = 1; //force exit
   }
 }
@@ -72,15 +73,14 @@ static int callback_shell(struct lws *wsi, enum lws_callback_reasons reason,
       perror("fcntl failed");
       exit(1);
     }
-    printf("PTY created and set to non-blocking mode\n");
+    if(ws_log_level != 0) printf("PTY created and set to non-blocking mode\n");
     pss->buffer_len = 0;
     pss->write_pending = 0;
     lws_callback_on_writable(wsi);
     break;
 
   case LWS_CALLBACK_RECEIVE:
-    printf("recv %zu: '%.*s' 0x%02x\n", len, (int)len, (char *)in,
-           *(unsigned char *)in);
+    if(ws_log_level != 0) printf("recv %zu: '%.*s' 0x%02x\n", len, (int)len, (char *)in, *(unsigned char *)in);
     if (pss->pty_fd >= 0) {
       if (strncmp(in, "RESIZE:", 7) == 0) {
         int cols, rows;
@@ -91,15 +91,14 @@ static int callback_shell(struct lws *wsi, enum lws_callback_reasons reason,
         if (ioctl(pss->pty_fd, TIOCSWINSZ, &ws) == -1) {
           perror("ioctl TIOCSWINSZ failed");
         } else {
-          printf("Resized terminal to %d cols and %d rows\n", ws.ws_col,
-                 ws.ws_row);
+          if(ws_log_level != 0) printf("Resized terminal to %d cols and %d rows\n", ws.ws_col, ws.ws_row);
         }
       } else {
         n = write(pss->pty_fd, in, len);
         if (n < 0) {
           perror("write to pty failed");
         } else {
-          printf("Wrote %d bytes to PTY\n", n);
+          if(ws_log_level != 0) printf("Wrote %d bytes to PTY\n", n);
         }
       }
     }
@@ -116,11 +115,13 @@ static int callback_shell(struct lws *wsi, enum lws_callback_reasons reason,
           return -1;
         }
       } else if (n > 0) {
-        printf("sent %d: '", n);
-        for (int i = 0; i < n; i++) {
-          printf("%02x ", pss->buffer[LWS_PRE + i]);
+        if(ws_log_level != 0){
+          printf("sent %d: '", n);
+          for (int i = 0; i < n; i++) {
+            printf("%02x ", pss->buffer[LWS_PRE + i]);
+          }
+          printf("'\n");
         }
-        printf("'\n");
         pss->buffer_len = n;
         n = lws_write(wsi, pss->buffer + LWS_PRE, pss->buffer_len,
                       LWS_WRITE_BINARY);
@@ -128,7 +129,7 @@ static int callback_shell(struct lws *wsi, enum lws_callback_reasons reason,
           perror("lws_write failed");
           return -1;
         }
-        printf("Wrote %d bytes to WebSocket\n", n);
+        if(ws_log_level != 0) printf("Wrote %d bytes to WebSocket\n", n);
         pss->buffer_len = 0;
         pss->write_pending = 1;
       } else {
@@ -177,28 +178,21 @@ static struct lws_protocols protocols[] = {
 };
 
 void usage(const char *prog_name) {
-  fprintf(stderr,
-          "Usage: %s <port> <command> [keep_running_after_disconnect] "
-          "[log_level] [timeout]\n",
+  printf("Usage: %s <port> <command> [keep_running_after_disconnect] "
+          "[log_level] [timeout] [run_foreground]\n",
           prog_name);
-  fprintf(stderr, "  <port>    : Port number for WebSocket server\n");
-  fprintf(stderr, "  <command> : Command to execute in PTY\n");
-  fprintf(
-      stderr,
-      "  [keep_running_after_disconnect] : Optional, 0 or 1 (default: 0)\n");
-  fprintf(
-      stderr,
-      "  [log_level] : Optional, log level (default: LLL_ERR | LLL_WARN: %d)\n",
+  printf("  <port>    : Port number for WebSocket server\n");
+  printf("  <command> : Command to execute in PTY\n");
+  printf("  [keep_running_after_disconnect] : Optional, 0 or 1 (default: 0)\n");
+  printf("  [log_level] : Optional, log level (default: LLL_ERR | LLL_WARN: %d)\n",
       ws_log_level);
-  fprintf(stderr, "                insane log: %d\n",
+  printf("                insane log: %d\n",
           LLL_ERR | LLL_WARN | LLL_NOTICE | LLL_INFO | LLL_DEBUG | LLL_PARSER |
               LLL_HEADER | LLL_EXT | LLL_CLIENT | LLL_LATENCY | LLL_USER);
-  fprintf(
-      stderr,
-      "                LLL_ERR | LLL_WARN | LLL_NOTICE | LLL_INFO log: %d\n",
+  printf("                LLL_ERR | LLL_WARN | LLL_NOTICE | LLL_INFO log: %d\n",
       LLL_ERR | LLL_WARN | LLL_NOTICE | LLL_INFO);
-  fprintf(stderr,
-          "  [timeout] : Optional, timeout in seconds (default: %d)\n", ws_timeout_sec);
+  printf("  [timeout] : Optional, timeout in seconds (default: %d)\n", ws_timeout_sec);
+  printf("  [run_foreground] : Optional, run in foreground 0 or 1 (default: %d)\n", run_foreground);
 }
 
 int main(int argc, char **argv) {
@@ -230,6 +224,9 @@ int main(int argc, char **argv) {
     ws_timeout_sec = atoi(argv[5]);
   }
 
+  if (argc > 6) {
+    run_foreground = atoi(argv[6]);
+  }
 
   memset(&info, 0, sizeof(info));
   info.port = port;
@@ -259,8 +256,8 @@ int main(int argc, char **argv) {
   close(sock_fd); // close fd after test
 
 
-  printf("Creating libwebsockets context\n");
-  lws_set_log_level(ws_log_level, NULL);
+  lws_set_log_level(run_foreground ? ws_log_level : 0, NULL);
+  // printf("Creating libwebsockets context\n");
   context = lws_create_context(&info);
   if (!context) {
     fprintf(stderr, "lws init failed\n");
@@ -276,6 +273,14 @@ int main(int argc, char **argv) {
 
   printf("WebSocket server for '%s' started on port %d\n", global_command,
          port);
+
+  // Daemonize
+  if (!run_foreground) {
+      if (daemon(1, 0) == -1) {
+          perror("daemon failed");
+          return 1;
+      }
+  }
 
   while (!force_exit) {
     int n = lws_service(context, 50);
