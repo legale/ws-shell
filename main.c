@@ -26,7 +26,7 @@ struct per_session_data {
 const char *global_command;
 volatile int force_exit = 0;
 int keep_running_after_disconnect = 0;
-int ws_log_level = LLL_ERR; // Default log level
+int ws_log_level = 0; // Default log level
 int max_connections = 1; // Максимальное количество подключений
 int active_connections = 0; // Счетчик активных подключений
 int ws_timeout_sec = 10; //timeout
