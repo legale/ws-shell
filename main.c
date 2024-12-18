@@ -4,6 +4,7 @@
 #include <netinet/in.h>
 #include <pty.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,22 +22,24 @@ struct per_session_data {
   size_t buffer_len;
   int write_pending;
   const char *command;
+  bool send_a_ping;
 };
 
 const char *global_command;
 volatile int force_exit = 0;
 int keep_running_after_disconnect = 0;
-int ws_log_level = 0; // Default log level
-int max_connections = 1; // Максимальное количество подключений
+int ws_log_level = 0;       // Default log level
+int max_connections = 1;    // Максимальное количество подключений
 int active_connections = 0; // Счетчик активных подключений
-int ws_timeout_sec = 10; //timeout
-int run_foreground = 1; //run program foreground
+int ws_timeout_sec = 10;    // timeout
+int run_foreground = 1;     // run program foreground
 
 // Обработчик сигнала тайм-аута
 void timeout_handler(int signum) {
   if (active_connections == 0) {
-    printf("No connections received in %d sec. Shutting down...\n", ws_timeout_sec);
-    force_exit = 1; //force exit
+    printf("No connections received in %d sec. Shutting down...\n",
+           ws_timeout_sec);
+    force_exit = 1; // force exit
   }
 }
 
@@ -47,14 +50,15 @@ static int callback_shell(struct lws *wsi, enum lws_callback_reasons reason,
 
   switch (reason) {
   case LWS_CALLBACK_ESTABLISHED:
+    lws_set_timer_usecs(wsi, 5 * LWS_USEC_PER_SEC);
     if (active_connections >= max_connections) {
       printf("Max connections reached. Closing new connection.\n");
       lws_close_reason(wsi, LWS_CLOSE_STATUS_GOINGAWAY,
                        (unsigned char *)"Max connections reached", 21);
       return -1; // close if connection limit reached
     }
-		//set timeout
-		lws_set_timeout(wsi, PENDING_TIMEOUT_USER_OK, 1200);
+    // set timeout
+    lws_set_timeout(wsi, PENDING_TIMEOUT_USER_OK, 1200);
     active_connections++;
     printf("Connection established, active connections: %d\n",
            active_connections);
@@ -74,14 +78,17 @@ static int callback_shell(struct lws *wsi, enum lws_callback_reasons reason,
       perror("fcntl failed");
       exit(1);
     }
-    if(ws_log_level != 0) printf("PTY created and set to non-blocking mode\n");
+    if (ws_log_level != 0)
+      printf("PTY created and set to non-blocking mode\n");
     pss->buffer_len = 0;
     pss->write_pending = 0;
     lws_callback_on_writable(wsi);
     break;
 
   case LWS_CALLBACK_RECEIVE:
-    if(ws_log_level != 0) printf("recv %zu: '%.*s' 0x%02x\n", len, (int)len, (char *)in, *(unsigned char *)in);
+    if (ws_log_level != 0)
+      printf("recv %zu: '%.*s' 0x%02x\n", len, (int)len, (char *)in,
+             *(unsigned char *)in);
     if (pss->pty_fd >= 0) {
       if (strncmp(in, "RESIZE:", sizeof("RESIZE:") - 1) == 0) {
         int cols, rows;
@@ -92,23 +99,26 @@ static int callback_shell(struct lws *wsi, enum lws_callback_reasons reason,
         if (ioctl(pss->pty_fd, TIOCSWINSZ, &ws) == -1) {
           perror("ioctl TIOCSWINSZ failed");
         } else {
-          if(ws_log_level != 0) printf("Resized terminal to %d cols and %d rows\n", ws.ws_col, ws.ws_row);
+          if (ws_log_level != 0)
+            printf("Resized terminal to %d cols and %d rows\n", ws.ws_col,
+                   ws.ws_row);
         }
-			} else if (strncmp(in, "CLIENT_PING:", sizeof("CLIENT_PING:") - 1) == 0) {
-				printf("%s: CLIENT_PING:\n",__func__);
-				char msg[64];
-				int n = snprintf(msg, sizeof(msg), "WS_PONG:");
-				unsigned char buf[LWS_PRE + 64];
-				unsigned char *p = &buf[LWS_PRE];
-				memcpy(p, msg, n);
-				lws_write(wsi, p, n, LWS_WRITE_BINARY);
-
+      } else if (strncmp(in, "CLIENT_PING:", sizeof("CLIENT_PING:") - 1) == 0) {
+        printf("%s: CLIENT_PING:\n", __func__);
+        char msg[64];
+        int n = snprintf(msg, sizeof(msg), "WS_PONG:");
+        printf("%s sent: %s\n", __func__, msg);
+        unsigned char buf[LWS_PRE + 64];
+        unsigned char *p = &buf[LWS_PRE];
+        memcpy(p, msg, n);
+        lws_write(wsi, p, n, LWS_WRITE_BINARY);
       } else {
         n = write(pss->pty_fd, in, len);
         if (n < 0) {
           perror("write to pty failed");
         } else {
-          if(ws_log_level != 0) printf("Wrote %d bytes to PTY\n", n);
+          if (ws_log_level != 0)
+            printf("Wrote %d bytes to PTY\n", n);
         }
       }
     }
@@ -116,6 +126,19 @@ static int callback_shell(struct lws *wsi, enum lws_callback_reasons reason,
     break;
 
   case LWS_CALLBACK_SERVER_WRITEABLE:
+    if (pss->send_a_ping) {
+      char buf[LWS_PRE + 100];
+      char *p = &buf[LWS_PRE];
+      ssize_t n = snprintf(p, sizeof(buf) - LWS_PRE, "PiNg");
+      ssize_t m = lws_write(wsi, (uint8_t *)p, n, LWS_WRITE_PING);
+      if (m < n) {
+        printf("%s error: send ping\n", __func__);
+      } else {
+        printf("%s sent: ping\n", __func__);
+      }
+      pss->write_pending = 1;
+      pss->send_a_ping = 0;
+    }
     if (pss->pty_fd >= 0) {
       n = read(pss->pty_fd, pss->buffer + LWS_PRE,
                sizeof(pss->buffer) - LWS_PRE);
@@ -125,7 +148,7 @@ static int callback_shell(struct lws *wsi, enum lws_callback_reasons reason,
           return -1;
         }
       } else if (n > 0) {
-        if(ws_log_level != 0){
+        if (ws_log_level != 0) {
           printf("sent %d: '", n);
           for (int i = 0; i < n; i++) {
             printf("%02x ", pss->buffer[LWS_PRE + i]);
@@ -139,7 +162,8 @@ static int callback_shell(struct lws *wsi, enum lws_callback_reasons reason,
           perror("lws_write failed");
           return -1;
         }
-        if(ws_log_level != 0) printf("Wrote %d bytes to WebSocket\n", n);
+        if (ws_log_level != 0)
+          printf("Wrote %d bytes to WebSocket\n", n);
         pss->buffer_len = 0;
         pss->write_pending = 1;
       } else {
@@ -169,6 +193,12 @@ static int callback_shell(struct lws *wsi, enum lws_callback_reasons reason,
     }
     break;
 
+  case LWS_CALLBACK_TIMER:
+    pss->send_a_ping = 1;
+    lws_callback_on_writable(wsi);
+    lws_set_timer_usecs(wsi, 5 * LWS_USEC_PER_SEC);
+    break;
+
   default:
     break;
   }
@@ -189,20 +219,25 @@ static struct lws_protocols protocols[] = {
 
 void usage(const char *prog_name) {
   printf("Usage: %s <port> <command> [keep_running_after_disconnect] "
-          "[log_level] [timeout] [run_foreground]\n",
-          prog_name);
+         "[log_level] [timeout] [run_foreground] [max_connections]\n",
+         prog_name);
   printf("  <port>    : Port number for WebSocket server\n");
   printf("  <command> : Command to execute in PTY\n");
   printf("  [keep_running_after_disconnect] : Optional, 0 or 1 (default: 0)\n");
-  printf("  [log_level] : Optional, log level (default: LLL_ERR | LLL_WARN: %d)\n",
-      ws_log_level);
+  printf("  [log_level] : Optional, log level (default: LLL_ERR | LLL_WARN: "
+         "%d)\n",
+         ws_log_level);
   printf("                insane log: %d\n",
-          LLL_ERR | LLL_WARN | LLL_NOTICE | LLL_INFO | LLL_DEBUG | LLL_PARSER |
-              LLL_HEADER | LLL_EXT | LLL_CLIENT | LLL_LATENCY | LLL_USER);
+         LLL_ERR | LLL_WARN | LLL_NOTICE | LLL_INFO | LLL_DEBUG | LLL_PARSER |
+             LLL_HEADER | LLL_EXT | LLL_CLIENT | LLL_LATENCY | LLL_USER);
   printf("                LLL_ERR | LLL_WARN | LLL_NOTICE | LLL_INFO log: %d\n",
-      LLL_ERR | LLL_WARN | LLL_NOTICE | LLL_INFO);
-  printf("  [timeout] : Optional, timeout in seconds (default: %d)\n", ws_timeout_sec);
-  printf("  [run_foreground] : Optional, run in foreground 0 or 1 (default: %d)\n", run_foreground);
+         LLL_ERR | LLL_WARN | LLL_NOTICE | LLL_INFO);
+  printf("  [timeout] : Optional, timeout in seconds (default: %d)\n",
+         ws_timeout_sec);
+  printf("  [run_foreground] : Optional, run in foreground 0 or 1 (default: "
+         "%d)\n",
+         run_foreground);
+  printf("  [max_connections] : Optional,  (default: %d)\n", max_connections);
 }
 
 int main(int argc, char **argv) {
@@ -216,7 +251,7 @@ int main(int argc, char **argv) {
   }
 
   port = atoi(argv[1]);
-  if (port < 1){
+  if (port < 1) {
     fprintf(stderr, "error: port must be > 0\n");
     return 1;
   }
@@ -238,13 +273,17 @@ int main(int argc, char **argv) {
     run_foreground = atoi(argv[6]);
   }
 
+  if (argc > 7) {
+    max_connections = atoi(argv[7]);
+  }
+
   memset(&info, 0, sizeof(info));
   info.port = port;
   info.protocols = protocols;
   info.gid = -1;
   info.uid = -1;
   info.options = LWS_SERVER_OPTION_VALIDATE_UTF8;
-	info.timeout_secs = 1200;
+  info.timeout_secs = 5;
 
   // test before start
   int sock_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -266,7 +305,6 @@ int main(int argc, char **argv) {
   }
   close(sock_fd); // close fd after test
 
-
   lws_set_log_level(run_foreground ? ws_log_level : 0, NULL);
   // printf("Creating libwebsockets context\n");
   context = lws_create_context(&info);
@@ -274,7 +312,6 @@ int main(int argc, char **argv) {
     fprintf(stderr, "lws init failed\n");
     return 1;
   }
-
 
   // set timeout
   if (ws_timeout_sec > 0) {
@@ -287,10 +324,10 @@ int main(int argc, char **argv) {
 
   // Daemonize
   if (!run_foreground) {
-      if (daemon(1, 0) == -1) {
-          perror("daemon failed");
-          return 1;
-      }
+    if (daemon(1, 0) == -1) {
+      perror("daemon failed");
+      return 1;
+    }
   }
 
   while (!force_exit) {
