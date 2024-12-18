@@ -53,6 +53,8 @@ static int callback_shell(struct lws *wsi, enum lws_callback_reasons reason,
                        (unsigned char *)"Max connections reached", 21);
       return -1; // close if connection limit reached
     }
+		//set timeout
+		lws_set_timeout(wsi, PENDING_TIMEOUT_USER_OK, 1200);
     active_connections++;
     printf("Connection established, active connections: %d\n",
            active_connections);
@@ -81,9 +83,9 @@ static int callback_shell(struct lws *wsi, enum lws_callback_reasons reason,
   case LWS_CALLBACK_RECEIVE:
     if(ws_log_level != 0) printf("recv %zu: '%.*s' 0x%02x\n", len, (int)len, (char *)in, *(unsigned char *)in);
     if (pss->pty_fd >= 0) {
-      if (strncmp(in, "RESIZE:", 7) == 0) {
+      if (strncmp(in, "RESIZE:", sizeof("RESIZE:") - 1) == 0) {
         int cols, rows;
-        sscanf(in + 7, "%d:%d", &cols, &rows);
+        sscanf(in + sizeof("RESIZE:") - 1, "%d:%d", &cols, &rows);
         struct winsize ws;
         ws.ws_col = cols;
         ws.ws_row = rows;
@@ -92,6 +94,15 @@ static int callback_shell(struct lws *wsi, enum lws_callback_reasons reason,
         } else {
           if(ws_log_level != 0) printf("Resized terminal to %d cols and %d rows\n", ws.ws_col, ws.ws_row);
         }
+			} else if (strncmp(in, "CLIENT_PING:", sizeof("CLIENT_PING:") - 1) == 0) {
+				printf("%s: CLIENT_PING:\n",__func__);
+				char msg[64];
+				int n = snprintf(msg, sizeof(msg), "WS_PONG:");
+				unsigned char buf[LWS_PRE + 64];
+				unsigned char *p = &buf[LWS_PRE];
+				memcpy(p, msg, n);
+				lws_write(wsi, p, n, LWS_WRITE_BINARY);
+
       } else {
         n = write(pss->pty_fd, in, len);
         if (n < 0) {
@@ -233,6 +244,7 @@ int main(int argc, char **argv) {
   info.gid = -1;
   info.uid = -1;
   info.options = LWS_SERVER_OPTION_VALIDATE_UTF8;
+	info.timeout_secs = 1200;
 
   // test before start
   int sock_fd = socket(AF_INET, SOCK_STREAM, 0);

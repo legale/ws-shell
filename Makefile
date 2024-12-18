@@ -5,7 +5,7 @@ SRC = main.c
 CC     = gcc
 FLAGS += -pipe -Wall -Wextra -Wno-unused-parameter -ffunction-sections -fdata-sections -Wl,--gc-sections
 DEFINE += -DLINUX
-INCLUDE = -I /usr/src/linux-headers-$(shell uname -m) -I /usr/include/
+INCLUDE = -I /usr/src/linux-headers-$(shell uname -m) -I /usr/include/ -I libwebsockets/include
 OBJ     = $(SRC:.c=.o)
 CFLAGS  += $(FLAGS) $(INCLUDE) $(DEFINE)
 LDFLAGS += -L/usr/lib
